@@ -1,0 +1,174 @@
+//! Snapshotting agent state and writing simulation output to CSV.
+
+use std::io::{self, Write};
+
+use crate::concentration::ConcentrationField;
+use crate::unified::UnifiedTickStats;
+use crate::unified::UnifiedEngine;
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentSnapshot {
+    pub tick: u64,
+    pub id: usize,
+    pub position: [f64; 3],
+    pub payload: f64,
+}
+
+pub fn snapshot_agents(engine: &UnifiedEngine, tick: u64) -> Vec<AgentSnapshot> {
+    engine
+        .agents
+        .iter()
+        .enumerate()
+        .map(|(id, a)| AgentSnapshot { tick, id, position: a.position, payload: a.payload })
+        .collect()
+}
+
+pub fn write_agent_snapshots_csv<W: Write>(writer: &mut W, snapshots: &[AgentSnapshot]) -> io::Result<()> {
+    writeln!(writer, "tick,id,x,y,z,payload")?;
+    for s in snapshots {
+        writeln!(
+            writer,
+            "{},{},{:.6},{:.6},{:.6},{:.6}",
+            s.tick, s.id, s.position[0], s.position[1], s.position[2], s.payload
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_field_csv<W: Write>(writer: &mut W, field: &ConcentrationField) -> io::Result<()> {
+    writeln!(writer, "i,j,k,mass")?;
+    for k in 0..field.nz {
+        for j in 0..field.ny {
+            for i in 0..field.nx {
+                let cell_size = field.cell_size();
+                let center = [
+                    field.bounds.min[0] + (i as f64 + 0.5) * cell_size[0],
+                    field.bounds.min[1] + (j as f64 + 0.5) * cell_size[1],
+                    field.bounds.min[2] + (k as f64 + 0.5) * cell_size[2],
+                ];
+                let mass = field.sample(center) * field.cell_volume();
+                writeln!(writer, "{i},{j},{k},{mass:.6}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn write_unified_tick_stats_csv<W: Write>(writer: &mut W, history: &[UnifiedTickStats]) -> io::Result<()> {
+    writeln!(writer, "tick,total_agent_payload,total_field_mass,total_combined_mass,cumulative_eliminated")?;
+    for s in history {
+        writeln!(
+            writer,
+            "{},{:.6},{:.6},{:.6},{:.6}",
+            s.tick, s.total_agent_payload, s.total_field_mass, s.total_combined_mass, s.cumulative_eliminated
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{Agent, AgentParams};
+    use crate::environment::Bounds;
+    use crate::interaction::InteractionParams;
+    use crate::orchestration::SpatialIndex;
+
+    fn small_engine() -> UnifiedEngine {
+        let bounds = Bounds::new([-5.0, -5.0, -5.0], [5.0, 5.0, 5.0]);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.1, k_elim: 0.0, k_release: 0.1 };
+        let field = ConcentrationField::new(bounds, 4, 4, 4);
+        let index = SpatialIndex::new(bounds, 3, 3, 3);
+        let interaction = InteractionParams { radius: 1.0, k_exchange: 0.1 };
+        UnifiedEngine::new(
+            vec![Agent::new([0.0, 0.0, 0.0], 5.0), Agent::new([1.0, 1.0, 1.0], 3.0)],
+            params,
+            bounds,
+            field,
+            0.1,
+            index,
+            interaction,
+            0.01,
+        )
+    }
+
+    #[test]
+    fn snapshot_agents_captures_every_agent() {
+        let engine = small_engine();
+        let snaps = snapshot_agents(&engine, 5);
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].tick, 5);
+        assert_eq!(snaps[1].id, 1);
+    }
+
+    #[test]
+    fn agent_snapshot_csv_round_trips_row_count() {
+        let engine = small_engine();
+        let snaps = snapshot_agents(&engine, 0);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_agent_snapshots_csv(&mut buf, &snaps).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3); // header + 2 agents
+        assert_eq!(lines[0], "tick,id,x,y,z,payload");
+    }
+
+    #[test]
+    fn agent_snapshot_csv_preserves_payload_values() {
+        let engine = small_engine();
+        let snaps = snapshot_agents(&engine, 0);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_agent_snapshots_csv(&mut buf, &snaps).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let cols: Vec<&str> = lines[1].split(',').collect();
+        let payload: f64 = cols[5].parse().unwrap();
+        assert!((payload - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn field_csv_row_count_matches_total_cell_count() {
+        let mut field = ConcentrationField::new(Bounds::new([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]), 2, 2, 2);
+        field.deposit([1.0, 1.0, 1.0], 10.0);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_field_csv(&mut buf, &field).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 1 + 2 * 2 * 2); // header + 8 cells
+    }
+
+    #[test]
+    fn field_csv_total_mass_matches_field_total_mass() {
+        let mut field = ConcentrationField::new(Bounds::new([0.0, 0.0, 0.0], [4.0, 4.0, 4.0]), 3, 3, 3);
+        field.deposit([1.0, 1.0, 1.0], 7.5);
+        field.deposit([3.0, 3.0, 3.0], 2.5);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_field_csv(&mut buf, &field).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        let sum: f64 = text.lines().skip(1).map(|line| line.split(',').nth(3).unwrap().parse::<f64>().unwrap()).sum();
+        assert!((sum - field.total_mass()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn unified_tick_stats_csv_round_trips_row_count() {
+        let mut engine = small_engine();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+        use rand::SeedableRng;
+        let stats = engine.run(10, 0.1, &mut rng);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_unified_tick_stats_csv(&mut buf, &stats).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        assert_eq!(text.lines().count(), stats.len() + 1);
+    }
+
+    #[test]
+    fn unified_tick_stats_csv_header_matches_expected_columns() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        write_unified_tick_stats_csv::<std::io::Cursor<Vec<u8>>>(&mut buf, &[]).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        assert_eq!(
+            text.trim(),
+            "tick,total_agent_payload,total_field_mass,total_combined_mass,cumulative_eliminated"
+        );
+    }
+}
