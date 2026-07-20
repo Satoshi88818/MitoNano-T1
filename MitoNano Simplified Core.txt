@@ -1,0 +1,103 @@
+
+
+### Project Structure 
+- `mitonano-core/` — Library with engine, params, effort, provenance, versioning
+- `src/main.rs` — Simple CLI demo
+
+### Key Files
+
+**`Cargo.toml`** (workspace root)
+```toml
+[workspace]
+members = ["mitonano-core"]
+
+[package]
+name = "mitonano"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mitonano-core = { path = "mitonano-core" }
+```
+
+**`mitonano-core/Cargo.toml`**
+```toml
+[package]
+name = "mitonano-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nalgebra = "0.32"
+nalgebra-sparse = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+```
+
+**Core Engine** (`mitonano-core/src/engine.rs`)
+```rust
+use crate::{effort::EffortAllocator, params::Params, provenance::ProvenanceLog, version::V14};
+
+#[derive(Debug)]
+pub struct SimulationEngine {
+    params: Params,
+    effort: EffortAllocator,
+    pub provenance: ProvenanceLog,
+    pub version: V14<()>, // Placeholder for composition
+}
+
+impl SimulationEngine {
+    pub fn new(params: Params) -> Self {
+        let effort = EffortAllocator::new(params.effort.clone());
+        SimulationEngine {
+            params,
+            effort,
+            provenance: ProvenanceLog::default(),
+            version: V14 { inner: (), adaptive_cadence: true },
+        }
+    }
+
+    pub fn step(&mut self, dt: f64) -> String {
+        let drift = 0.3; // TODO: Real drift from FEM/IMM
+        let budget = self.effort.compute_budget(drift);
+        
+        self.provenance.record(format!("Step dt={:.2} budget={:.2}", dt, budget));
+        
+        if self.version.adaptive_cadence {
+            self.provenance.record("Pillar 1: Adaptive resegmentation triggered".to_string());
+            // TODO: Call FEM re-mesh here based on activity
+        }
+        
+        format!("Step complete. Drift: {:.2}, Budget: {:.2}", drift, budget)
+    }
+}
+```
+
+Other modules (`params.rs`, `effort.rs`, `provenance.rs`, `version.rs`) are straightforward as previously defined.
+
+**Demo** (`src/main.rs`)
+```rust
+use mitonano_core::{engine::SimulationEngine, params::{Params, EffortConfig}};
+
+fn main() {
+    let params = Params {
+        dt: 0.1,
+        effort: EffortConfig { base_budget: 1.0, drift_multiplier: 2.0 },
+    };
+
+    let mut engine = SimulationEngine::new(params);
+    
+    for i in 0..5 {
+        println!("Step {}: {}", i, engine.step(0.1));
+    }
+    
+    println!("Provenance entries: {}", engine.provenance.len());
+}
+```
+
+### How to Use / Extend
+1. Clone or copy this structure.
+2. Drop **FEM Chain** and **IMM Tracker** crates into the workspace.
+3. Wire them into `SimulationEngine::step()` (e.g., `self.fem.adaptive_solve(...)` using the budget).
+4. Expand `V14` with real fields for each pillar.
+
+
