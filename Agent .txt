@@ -1,0 +1,141 @@
+//! An agent: a point particle with a 3D position and a scalar payload,
+//! moving by drift-diffusion (`sde::euler_maruyama_step`, reflected at
+//! the domain boundary) and decaying via `pk::exact_decay_and_release`.
+
+use rand::Rng;
+
+use crate::environment::Bounds;
+use crate::pk::exact_decay_and_release;
+use crate::sde::euler_maruyama_step;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Agent {
+    pub position: [f64; 3],
+    pub payload: f64,
+}
+
+impl Agent {
+    pub fn new(position: [f64; 3], payload: f64) -> Self {
+        Agent { position, payload }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AgentParams {
+    pub drift: [f64; 3],
+    pub diffusion_coeff: f64,
+    pub k_elim: f64,
+    pub k_release: f64,
+}
+
+impl Agent {
+    /// Advances position by one Euler-Maruyama step per axis, reflecting
+    /// back into `bounds` if the step would carry the agent outside it.
+    pub fn advance_position<R: Rng + ?Sized>(&mut self, params: &AgentParams, bounds: &Bounds, dt: f64, rng: &mut R) {
+        let mut next = [0.0; 3];
+        for i in 0..3 {
+            next[i] = euler_maruyama_step(self.position[i], params.drift[i], params.diffusion_coeff, dt, rng);
+        }
+        self.position = bounds.reflect(next);
+    }
+
+    /// Applies one tick's exact decay, reducing `self.payload` and
+    /// returning `(released, eliminated)`.
+    pub fn decay_and_release(&mut self, params: &AgentParams, dt: f64) -> (f64, f64) {
+        let (released, eliminated) = exact_decay_and_release(self.payload, params.k_release, params.k_elim, dt);
+        self.payload -= released + eliminated;
+        (released, eliminated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn params(k_release: f64, k_elim: f64) -> AgentParams {
+        AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.1, k_elim, k_release }
+    }
+
+    #[test]
+    fn zero_drift_zero_diffusion_keeps_agent_stationary() {
+        let mut agent = Agent::new([1.0, 2.0, 3.0], 10.0);
+        let p = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.0, k_release: 0.0 };
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let mut rng = StdRng::seed_from_u64(1);
+        for _ in 0..50 {
+            agent.advance_position(&p, &bounds, 0.01, &mut rng);
+        }
+        assert_eq!(agent.position, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn advance_position_never_leaves_bounds() {
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 10.0);
+        let p = AgentParams { drift: [2.0, -1.5, 0.5], diffusion_coeff: 3.0, k_elim: 0.0, k_release: 0.0 };
+        let bounds = Bounds::new([-2.0, -2.0, -2.0], [2.0, 2.0, 2.0]);
+        let mut rng = StdRng::seed_from_u64(3);
+        for _ in 0..2000 {
+            agent.advance_position(&p, &bounds, 0.05, &mut rng);
+            assert!(bounds.contains(agent.position), "agent left bounds: {:?}", agent.position);
+        }
+    }
+
+    #[test]
+    fn decay_and_release_exactly_conserves_payload() {
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 40.0);
+        let p = params(0.2, 0.1);
+        let before = agent.payload;
+        let (released, eliminated) = agent.decay_and_release(&p, 0.3);
+        assert!((before - (agent.payload + released + eliminated)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn repeated_decay_matches_closed_form_exponential_total_remaining() {
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 100.0);
+        let p = params(0.15, 0.05);
+        let dt = 0.01;
+        let n_steps = 500;
+        for _ in 0..n_steps {
+            agent.decay_and_release(&p, dt);
+        }
+        let k_total = p.k_release + p.k_elim;
+        let expected_remaining = 100.0 * (-k_total * dt * n_steps as f64).exp();
+        let rel_err = (agent.payload - expected_remaining).abs() / expected_remaining;
+        assert!(rel_err < 1e-9, "remaining={}, expected={}", agent.payload, expected_remaining);
+    }
+
+    #[test]
+    fn zero_rate_constants_produce_zero_decay() {
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 25.0);
+        let p = params(0.0, 0.0);
+        let (released, eliminated) = agent.decay_and_release(&p, 1.0);
+        assert_eq!(released, 0.0);
+        assert_eq!(eliminated, 0.0);
+        assert_eq!(agent.payload, 25.0);
+    }
+
+    #[test]
+    fn zero_payload_produces_zero_decay_without_going_negative() {
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 0.0);
+        let p = params(0.5, 0.5);
+        let (released, eliminated) = agent.decay_and_release(&p, 1.0);
+        assert_eq!(released, 0.0);
+        assert_eq!(eliminated, 0.0);
+        assert_eq!(agent.payload, 0.0);
+    }
+
+    #[test]
+    fn positive_drift_moves_mean_position_in_drift_direction() {
+        let bounds = Bounds::new([-1000.0, -1000.0, -1000.0], [1000.0, 1000.0, 1000.0]);
+        let p = AgentParams { drift: [1.0, 0.0, 0.0], diffusion_coeff: 0.01, k_elim: 0.0, k_release: 0.0 };
+        let mut rng = StdRng::seed_from_u64(5);
+        let mut agent = Agent::new([0.0, 0.0, 0.0], 1.0);
+        for _ in 0..1000 {
+            agent.advance_position(&p, &bounds, 0.01, &mut rng);
+        }
+        // Expected drift displacement: drift * total_time = 1.0 * 10.0 = 10.0
+        assert!((agent.position[0] - 10.0).abs() < 1.0, "x={}", agent.position[0]);
+    }
+}
