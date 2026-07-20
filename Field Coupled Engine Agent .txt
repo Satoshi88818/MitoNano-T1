@@ -1,0 +1,237 @@
+//! Adds the field: agents release decayed payload into a `ConcentrationField`
+//! (and, in the feedback variant, also draw payload back out of it) — but
+//! still no agent-agent interaction, which is `orchestration.rs` /
+//! `interaction.rs` / `unified.rs`'s layer. The point of testing this
+//! layer on its own is isolating the field release/uptake exchange's
+//! correctness before it's combined with agent-agent exchange too.
+
+use rand::Rng;
+
+use crate::agent::{Agent, AgentParams};
+use crate::concentration::ConcentrationField;
+use crate::environment::Bounds;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CoupledTickStats {
+    pub tick: u64,
+    pub total_agent_payload: f64,
+    pub total_field_mass: f64,
+    pub total_combined_mass: f64,
+    pub cumulative_eliminated: f64,
+}
+
+/// Same fields as `CoupledTickStats`, kept as a distinct type for the
+/// uptake-feedback run mode so the two run modes' return types can't be
+/// accidentally mixed up at a call site even though they carry the same
+/// data today.
+pub type FeedbackTickStats = CoupledTickStats;
+
+pub struct CoupledEngine {
+    pub agents: Vec<Agent>,
+    pub params: AgentParams,
+    pub bounds: Bounds,
+    pub field: ConcentrationField,
+    pub field_diffusion_coeff: f64,
+    pub dt: f64,
+}
+
+impl CoupledEngine {
+    pub fn new(
+        agents: Vec<Agent>,
+        params: AgentParams,
+        bounds: Bounds,
+        field: ConcentrationField,
+        field_diffusion_coeff: f64,
+        dt: f64,
+    ) -> Self {
+        CoupledEngine { agents, params, bounds, field, field_diffusion_coeff, dt }
+    }
+
+    fn stats(&self, tick: u64, cumulative_eliminated: f64) -> CoupledTickStats {
+        let total_agent_payload: f64 = self.agents.iter().map(|a| a.payload).sum();
+        let total_field_mass = self.field.total_mass();
+        CoupledTickStats {
+            tick,
+            total_agent_payload,
+            total_field_mass,
+            total_combined_mass: total_agent_payload + total_field_mass,
+            cumulative_eliminated,
+        }
+    }
+
+    /// Release-only mode: agents deposit decayed payload into the field
+    /// but never withdraw from it. One-directional transfer, the simplest
+    /// case to validate exact conservation against.
+    pub fn run_release_only<R: Rng + ?Sized>(&mut self, n_ticks: u64, rng: &mut R) -> Vec<CoupledTickStats> {
+        let mut history = Vec::with_capacity(n_ticks as usize + 1);
+        let mut cumulative_eliminated = 0.0;
+        history.push(self.stats(0, cumulative_eliminated));
+
+        for tick in 1..=n_ticks {
+            for agent in &mut self.agents {
+                agent.advance_position(&self.params, &self.bounds, self.dt, rng);
+                let (released, eliminated) = agent.decay_and_release(&self.params, self.dt);
+                cumulative_eliminated += eliminated;
+                if released > 0.0 {
+                    self.field.deposit(agent.position, released);
+                }
+            }
+            self.field.step(self.dt, self.field_diffusion_coeff);
+            history.push(self.stats(tick, cumulative_eliminated));
+        }
+        history
+    }
+
+    /// Bidirectional mode: agents also sense and withdraw from the field
+    /// (uptake) before releasing their own decayed payload — two
+    /// simultaneous transfer pathways active at once.
+    pub fn run_with_uptake<R: Rng + ?Sized>(
+        &mut self,
+        n_ticks: u64,
+        k_uptake: f64,
+        rng: &mut R,
+    ) -> Vec<FeedbackTickStats> {
+        let mut history = Vec::with_capacity(n_ticks as usize + 1);
+        let mut cumulative_eliminated = 0.0;
+        history.push(self.stats(0, cumulative_eliminated));
+
+        for tick in 1..=n_ticks {
+            for agent in &mut self.agents {
+                agent.advance_position(&self.params, &self.bounds, self.dt, rng);
+                let c_local = self.field.sample(agent.position);
+                let desired_uptake = k_uptake * c_local * self.dt;
+                let actual_uptake = self.field.withdraw(agent.position, desired_uptake);
+                agent.payload += actual_uptake;
+                let (released, eliminated) = agent.decay_and_release(&self.params, self.dt);
+                cumulative_eliminated += eliminated;
+                if released > 0.0 {
+                    self.field.deposit(agent.position, released);
+                }
+            }
+            self.field.step(self.dt, self.field_diffusion_coeff);
+            history.push(self.stats(tick, cumulative_eliminated));
+        }
+        history
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn small_field() -> ConcentrationField {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        ConcentrationField::new(bounds, 10, 10, 10)
+    }
+
+    fn agents(n: usize, payload: f64) -> Vec<Agent> {
+        (0..n).map(|i| Agent::new([i as f64 * 0.5 - 2.0, 0.0, 0.0], payload)).collect()
+    }
+
+    #[test]
+    fn release_only_exactly_matches_bookkeeping_identity() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.05, 0.0, 0.0], diffusion_coeff: 0.2, k_elim: 0.05, k_release: 0.2 };
+        let mut engine = CoupledEngine::new(agents(15, 8.0), params, bounds, small_field(), 0.15, 0.01);
+        let mut rng = StdRng::seed_from_u64(1);
+        let history = engine.run_release_only(300, &mut rng);
+        let c0 = history[0].total_combined_mass;
+        for stat in &history {
+            let expected = c0 - stat.cumulative_eliminated;
+            let rel_err = (stat.total_combined_mass - expected).abs() / c0;
+            assert!(rel_err < 1e-9, "tick {}: {} vs {}", stat.tick, stat.total_combined_mass, expected);
+        }
+    }
+
+    #[test]
+    fn release_only_field_mass_only_increases() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.1, k_elim: 0.0, k_release: 0.3 };
+        let mut engine = CoupledEngine::new(agents(10, 5.0), params, bounds, small_field(), 0.1, 0.01);
+        let mut rng = StdRng::seed_from_u64(2);
+        let history = engine.run_release_only(100, &mut rng);
+        let mut last = 0.0;
+        for stat in &history {
+            assert!(stat.total_field_mass >= last - 1e-12);
+            last = stat.total_field_mass;
+        }
+    }
+
+    #[test]
+    fn uptake_mode_exactly_matches_bookkeeping_identity_with_bidirectional_transfer() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.08, -0.02, 0.0], diffusion_coeff: 0.25, k_elim: 0.03, k_release: 0.15 };
+        let mut engine = CoupledEngine::new(agents(20, 6.0), params, bounds, small_field(), 0.18, 0.01);
+        let mut rng = StdRng::seed_from_u64(3);
+        let history = engine.run_with_uptake(400, 0.3, &mut rng);
+        let c0 = history[0].total_combined_mass;
+        for stat in &history {
+            let expected = c0 - stat.cumulative_eliminated;
+            let rel_err = (stat.total_combined_mass - expected).abs() / c0;
+            assert!(rel_err < 1e-9, "tick {}: {} vs {}", stat.tick, stat.total_combined_mass, expected);
+        }
+    }
+
+    #[test]
+    fn uptake_mode_with_zero_field_mass_never_gains_payload_from_nothing() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.0, k_release: 0.0 };
+        let mut engine = CoupledEngine::new(agents(5, 1.0), params, bounds, small_field(), 0.1, 0.01);
+        let mut rng = StdRng::seed_from_u64(4);
+        // Field starts empty and agents never release (k_release=0), so
+        // there's never anything to withdraw.
+        let history = engine.run_with_uptake(50, 10.0, &mut rng);
+        for stat in &history {
+            assert_eq!(stat.total_field_mass, 0.0);
+            assert!((stat.total_agent_payload - 5.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn zero_ticks_returns_only_initial_stats() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.1, k_elim: 0.0, k_release: 0.1 };
+        let mut engine = CoupledEngine::new(agents(3, 4.0), params, bounds, small_field(), 0.1, 0.01);
+        let mut rng = StdRng::seed_from_u64(5);
+        let history = engine.run_release_only(0, &mut rng);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tick, 0);
+    }
+
+    #[test]
+    fn higher_k_uptake_draws_down_field_faster() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.05, k_elim: 0.0, k_release: 0.3 };
+
+        let mut field_a = small_field();
+        field_a.deposit([0.0, 0.0, 0.0], 100.0);
+        let mut engine_low = CoupledEngine::new(agents(5, 2.0), params, bounds, field_a, 0.05, 0.01);
+
+        let mut field_b = small_field();
+        field_b.deposit([0.0, 0.0, 0.0], 100.0);
+        let mut engine_high = CoupledEngine::new(agents(5, 2.0), params, bounds, field_b, 0.05, 0.01);
+
+        let mut rng_a = StdRng::seed_from_u64(6);
+        let mut rng_b = StdRng::seed_from_u64(6);
+        let hist_low = engine_low.run_with_uptake(50, 0.1, &mut rng_a);
+        let hist_high = engine_high.run_with_uptake(50, 5.0, &mut rng_b);
+
+        assert!(hist_high.last().unwrap().total_field_mass < hist_low.last().unwrap().total_field_mass);
+    }
+
+    #[test]
+    fn no_agents_still_conserves_field_mass_through_diffusion() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.0, k_release: 0.0 };
+        let mut field = small_field();
+        field.deposit([1.0, 1.0, 1.0], 50.0);
+        let mut engine = CoupledEngine::new(vec![], params, bounds, field, 0.2, 0.01);
+        let mut rng = StdRng::seed_from_u64(7);
+        let history = engine.run_release_only(200, &mut rng);
+        for stat in &history {
+            assert!((stat.total_field_mass - 50.0).abs() < 1e-9);
+        }
+    }
+}
