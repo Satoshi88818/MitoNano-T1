@@ -1,0 +1,289 @@
+//! Agent-agent local payload exchange: nearby agents equalize payload
+//! toward each other at rate `k_exchange`, a self-canceling pairwise
+//! transfer (whatever one agent gains, its partner loses exactly).
+//!
+//! Four variants are provided, corresponding directly to the "next
+//! steps" from this crate's profiling work:
+//!
+//! - [`step_agent_interactions_brute_force`] — O(n^2) reference
+//!   implementation, used only to cross-validate the indexed versions.
+//! - [`step_agent_interactions_unoptimized`] — the *original* indexed
+//!   approach: each agent queries its own neighbor list independently, so
+//!   every unordered pair `(i, j)` gets visited and exchange-computed
+//!   **twice** (once from `i`'s query, once from `j`'s), each time
+//!   applying half the transfer. Kept specifically so its performance can
+//!   be compared directly against the fix below.
+//! - [`step_agent_interactions`] — the optimized default: each unordered
+//!   pair is visited and its exchange computed exactly **once** (via a
+//!   `j > i` filter on top of the same neighbor query), applying the full
+//!   transfer in one step. Mathematically identical result to the
+//!   unoptimized version — see `interaction_variants_produce_identical_results`
+//!   — but does roughly half the exchange-computation and delta-write
+//!   work.
+//! - [`step_agent_interactions_parallel`] — a `rayon`-parallelized
+//!   version. Deliberately uses the *unoptimized* (all-neighbors)
+//!   enumeration per agent rather than the unique-pair one: with a
+//!   unique-pair filter, applying agent `j`'s share of a transfer would
+//!   require writing into agent `i`'s delta slot from a different
+//!   thread's iteration — exactly the kind of cross-thread mutable
+//!   aliasing Rust's borrow checker won't allow through `par_iter`
+//!   without a lock. Structuring each agent's delta as self-contained
+//!   (computed entirely from an immutable snapshot, written only to that
+//!   agent's own slot) sidesteps synchronization entirely, at the cost of
+//!   redoing the "visit every neighbor" enumeration `step_agent_interactions`
+//!   avoided. Which of these two tradeoffs wins is an empirical question,
+//!   not something to assume — see the profiling comparison in this
+//!   crate's accompanying document.
+
+use rayon::prelude::*;
+
+use crate::agent::Agent;
+use crate::orchestration::SpatialIndex;
+
+#[derive(Clone, Copy, Debug)]
+pub struct InteractionParams {
+    pub radius: f64,
+    pub k_exchange: f64,
+}
+
+/// Amount transferred *from* `payload_j` *to* `payload_i` this step
+/// (negative if net flow is the other way): proportional to the payload
+/// difference, driving the pair toward equal payloads over time — the
+/// same functional form as Fourier/Fick diffusion, just between discrete
+/// agents instead of continuum cells.
+#[inline]
+fn exchange_amount(payload_i: f64, payload_j: f64, k_exchange: f64, dt: f64) -> f64 {
+    k_exchange * (payload_j - payload_i) * dt
+}
+
+fn apply_deltas(agents: &mut [Agent], deltas: &[f64]) {
+    for (agent, &d) in agents.iter_mut().zip(deltas.iter()) {
+        agent.payload += d;
+    }
+}
+
+/// O(n^2) reference implementation: every unordered pair, visited once,
+/// exchange computed against a fixed pre-tick snapshot (so the result
+/// doesn't depend on iteration order).
+pub fn step_agent_interactions_brute_force(agents: &mut [Agent], params: &InteractionParams, dt: f64) {
+    let snapshot: Vec<f64> = agents.iter().map(|a| a.payload).collect();
+    let n = agents.len();
+    let mut deltas = vec![0.0; n];
+    let radius_sq = params.radius * params.radius;
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let pi = agents[i].position;
+            let pj = agents[j].position;
+            let d2 = (pi[0] - pj[0]).powi(2) + (pi[1] - pj[1]).powi(2) + (pi[2] - pj[2]).powi(2);
+            if d2 <= radius_sq {
+                let ex = exchange_amount(snapshot[i], snapshot[j], params.k_exchange, dt);
+                deltas[i] += ex;
+                deltas[j] -= ex;
+            }
+        }
+    }
+    apply_deltas(agents, &deltas);
+}
+
+/// Optimized default: unique-pair enumeration via the spatial index (each
+/// pair's exchange computed exactly once).
+pub fn step_agent_interactions(
+    agents: &mut [Agent],
+    index: &SpatialIndex,
+    params: &InteractionParams,
+    dt: f64,
+) {
+    let snapshot: Vec<f64> = agents.iter().map(|a| a.payload).collect();
+    let n = agents.len();
+    let mut deltas = vec![0.0; n];
+
+    for i in 0..n {
+        let neighbors = index.neighbors_within(agents[i].position, params.radius, agents);
+        for j in neighbors {
+            if j <= i {
+                continue; // unique-pair filter: only process (i, j) with j > i
+            }
+            let ex = exchange_amount(snapshot[i], snapshot[j], params.k_exchange, dt);
+            deltas[i] += ex;
+            deltas[j] -= ex;
+        }
+    }
+    apply_deltas(agents, &deltas);
+}
+
+/// The original (pre-optimization) indexed approach: every pair is
+/// visited from both sides, each time applying half the transfer. Kept
+/// for direct performance comparison against [`step_agent_interactions`]
+/// — see this crate's profiling harness.
+pub fn step_agent_interactions_unoptimized(
+    agents: &mut [Agent],
+    index: &SpatialIndex,
+    params: &InteractionParams,
+    dt: f64,
+) {
+    let snapshot: Vec<f64> = agents.iter().map(|a| a.payload).collect();
+    let n = agents.len();
+    let mut deltas = vec![0.0; n];
+
+    for i in 0..n {
+        let neighbors = index.neighbors_within(agents[i].position, params.radius, agents);
+        for j in neighbors {
+            if j == i {
+                continue;
+            }
+            let ex = exchange_amount(snapshot[i], snapshot[j], params.k_exchange, dt);
+            // Half now (this encounter); the other half will be applied
+            // when j's own loop iteration finds i as its neighbor.
+            deltas[i] += 0.5 * ex;
+        }
+    }
+    apply_deltas(agents, &deltas);
+}
+
+/// `rayon`-parallel version: each agent's total delta is computed
+/// independently (visiting *all* its neighbors, not just `j > i`) purely
+/// from the immutable snapshot, so `par_iter` can compute every agent's
+/// delta concurrently with no shared mutable state and no locking.
+pub fn step_agent_interactions_parallel(
+    agents: &mut [Agent],
+    index: &SpatialIndex,
+    params: &InteractionParams,
+    dt: f64,
+) {
+    let snapshot: Vec<f64> = agents.iter().map(|a| a.payload).collect();
+    let positions: Vec<[f64; 3]> = agents.iter().map(|a| a.position).collect();
+
+    let deltas: Vec<f64> = (0..agents.len())
+        .into_par_iter()
+        .map(|i| {
+            let neighbors = index.neighbors_within(positions[i], params.radius, agents);
+            let mut delta_i = 0.0;
+            for j in neighbors {
+                if j == i {
+                    continue;
+                }
+                delta_i += exchange_amount(snapshot[i], snapshot[j], params.k_exchange, dt);
+            }
+            delta_i
+        })
+        .collect();
+
+    apply_deltas(agents, &deltas);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::Bounds;
+    use rand::rngs::StdRng;
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    fn random_agents(n: usize, bounds: &Bounds, seed: u64) -> Vec<Agent> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        (0..n)
+            .map(|_| {
+                let p = [
+                    rng.gen_range(bounds.min[0]..bounds.max[0]),
+                    rng.gen_range(bounds.min[1]..bounds.max[1]),
+                    rng.gen_range(bounds.min[2]..bounds.max[2]),
+                ];
+                Agent::new(p, rng.gen_range(1.0..20.0))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exchange_exactly_conserves_total_payload() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let mut agents = random_agents(60, &bounds, 1);
+        let mut index = SpatialIndex::new(bounds, 5, 5, 5);
+        index.rebuild(&agents);
+        let params = InteractionParams { radius: 1.5, k_exchange: 0.3 };
+
+        let total_before: f64 = agents.iter().map(|a| a.payload).sum();
+        step_agent_interactions(&mut agents, &index, &params, 0.01);
+        let total_after: f64 = agents.iter().map(|a| a.payload).sum();
+
+        assert!((total_before - total_after).abs() < 1e-9);
+    }
+
+    #[test]
+    fn optimized_matches_brute_force() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [12.0, 12.0, 12.0]);
+        let mut agents_indexed = random_agents(80, &bounds, 2);
+        let mut agents_brute = agents_indexed.clone();
+        let mut index = SpatialIndex::new(bounds, 6, 6, 6);
+        index.rebuild(&agents_indexed);
+        let params = InteractionParams { radius: 1.2, k_exchange: 0.25 };
+
+        step_agent_interactions(&mut agents_indexed, &index, &params, 0.02);
+        step_agent_interactions_brute_force(&mut agents_brute, &params, 0.02);
+
+        for (a, b) in agents_indexed.iter().zip(agents_brute.iter()) {
+            assert!((a.payload - b.payload).abs() < 1e-9);
+        }
+    }
+
+    /// The load-bearing correctness test for the optimization: the
+    /// unique-pair version and the deliberately-kept unoptimized
+    /// (double-visit, half-weight) version must produce bit-close
+    /// identical results, confirming the optimization changes only
+    /// *how much redundant work is done*, never the physics.
+    #[test]
+    fn interaction_variants_produce_identical_results() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [15.0, 15.0, 15.0]);
+        let mut agents_optimized = random_agents(150, &bounds, 3);
+        let mut agents_unoptimized = agents_optimized.clone();
+        let mut agents_parallel = agents_optimized.clone();
+        let mut index = SpatialIndex::new(bounds, 7, 7, 7);
+        index.rebuild(&agents_optimized);
+        let params = InteractionParams { radius: 1.0, k_exchange: 0.2 };
+
+        step_agent_interactions(&mut agents_optimized, &index, &params, 0.01);
+        step_agent_interactions_unoptimized(&mut agents_unoptimized, &index, &params, 0.01);
+        step_agent_interactions_parallel(&mut agents_parallel, &index, &params, 0.01);
+
+        for i in 0..agents_optimized.len() {
+            assert!(
+                (agents_optimized[i].payload - agents_unoptimized[i].payload).abs() < 1e-9,
+                "agent {i}: optimized={}, unoptimized={}",
+                agents_optimized[i].payload,
+                agents_unoptimized[i].payload
+            );
+            assert!(
+                (agents_optimized[i].payload - agents_parallel[i].payload).abs() < 1e-9,
+                "agent {i}: optimized={}, parallel={}",
+                agents_optimized[i].payload,
+                agents_parallel[i].payload
+            );
+        }
+    }
+
+    #[test]
+    fn agents_outside_radius_do_not_exchange() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [100.0, 100.0, 100.0]);
+        let mut agents = vec![Agent::new([0.0, 0.0, 0.0], 10.0), Agent::new([50.0, 50.0, 50.0], 0.0)];
+        let mut index = SpatialIndex::new(bounds, 10, 10, 10);
+        index.rebuild(&agents);
+        let params = InteractionParams { radius: 1.0, k_exchange: 0.5 };
+        step_agent_interactions(&mut agents, &index, &params, 0.1);
+        assert_eq!(agents[0].payload, 10.0);
+        assert_eq!(agents[1].payload, 0.0);
+    }
+
+    #[test]
+    fn parallel_version_exactly_conserves_total_payload() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let mut agents = random_agents(120, &bounds, 9);
+        let mut index = SpatialIndex::new(bounds, 6, 6, 6);
+        index.rebuild(&agents);
+        let params = InteractionParams { radius: 1.3, k_exchange: 0.3 };
+
+        let total_before: f64 = agents.iter().map(|a| a.payload).sum();
+        step_agent_interactions_parallel(&mut agents, &index, &params, 0.01);
+        let total_after: f64 = agents.iter().map(|a| a.payload).sum();
+        assert!((total_before - total_after).abs() < 1e-6, "before={total_before}, after={total_after}");
+    }
+}
