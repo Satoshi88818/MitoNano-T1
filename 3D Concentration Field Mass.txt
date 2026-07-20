@@ -1,0 +1,266 @@
+//! A 3D scalar field storing **mass per cell** (not concentration
+//! directly) over a uniform grid spanning a `Bounds` domain — this is
+//! what makes total-mass bookkeeping exact: `total_mass()` is a plain sum
+//! with no unit conversion to round off. `sample()` converts to
+//! concentration (mass / cell volume) only at the point of use.
+
+use crate::environment::Bounds;
+
+#[derive(Clone, Debug)]
+pub struct ConcentrationField {
+    pub bounds: Bounds,
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+    cells: Vec<f64>, // mass per cell
+}
+
+impl ConcentrationField {
+    pub fn new(bounds: Bounds, nx: usize, ny: usize, nz: usize) -> Self {
+        assert!(nx > 0 && ny > 0 && nz > 0);
+        ConcentrationField { bounds, nx, ny, nz, cells: vec![0.0; nx * ny * nz] }
+    }
+
+    #[inline]
+    fn index(&self, i: usize, j: usize, k: usize) -> usize {
+        i + self.nx * (j + self.ny * k)
+    }
+
+    pub fn cell_size(&self) -> [f64; 3] {
+        let s = self.bounds.size();
+        [s[0] / self.nx as f64, s[1] / self.ny as f64, s[2] / self.nz as f64]
+    }
+
+    pub fn cell_volume(&self) -> f64 {
+        let c = self.cell_size();
+        c[0] * c[1] * c[2]
+    }
+
+    /// Which cell a position falls into, clamped to valid grid indices
+    /// (a position exactly on the domain boundary, or a hair outside due
+    /// to floating point, still maps to a valid cell).
+    fn cell_of(&self, position: [f64; 3]) -> (usize, usize, usize) {
+        let c = self.cell_size();
+        let clamp_idx = |x: f64, lo: f64, cell: f64, n: usize| -> usize {
+            let raw = ((x - lo) / cell).floor();
+            let idx = raw.max(0.0) as usize;
+            idx.min(n - 1)
+        };
+        (
+            clamp_idx(position[0], self.bounds.min[0], c[0], self.nx),
+            clamp_idx(position[1], self.bounds.min[1], c[1], self.ny),
+            clamp_idx(position[2], self.bounds.min[2], c[2], self.nz),
+        )
+    }
+
+    /// Local concentration (mass / cell volume) at `position`.
+    pub fn sample(&self, position: [f64; 3]) -> f64 {
+        let (i, j, k) = self.cell_of(position);
+        self.cells[self.index(i, j, k)] / self.cell_volume()
+    }
+
+    /// Adds `mass` to the cell containing `position`.
+    pub fn deposit(&mut self, position: [f64; 3], mass: f64) {
+        let (i, j, k) = self.cell_of(position);
+        let idx = self.index(i, j, k);
+        self.cells[idx] += mass;
+    }
+
+    /// Removes up to `desired_mass` from the cell containing `position`,
+    /// capped at what's actually present (can't withdraw more than
+    /// exists) — returns the amount actually withdrawn.
+    pub fn withdraw(&mut self, position: [f64; 3], desired_mass: f64) -> f64 {
+        let (i, j, k) = self.cell_of(position);
+        let idx = self.index(i, j, k);
+        let available = self.cells[idx];
+        let actual = desired_mass.min(available).max(0.0);
+        self.cells[idx] -= actual;
+        actual
+    }
+
+    pub fn total_mass(&self) -> f64 {
+        self.cells.iter().sum()
+    }
+
+    /// One explicit (FTCS) diffusion step: exchanges mass between
+    /// axis-adjacent cells proportional to their concentration
+    /// difference, with **no-flux (Neumann) boundaries** — domain-edge
+    /// cells simply have fewer neighbor terms rather than a wrapped or
+    /// mirrored one, so no mass crosses the domain boundary and total
+    /// mass is exactly conserved by construction (every unit of mass
+    /// leaving one cell enters exactly one neighboring cell).
+    ///
+    /// Stability requires `dt` small enough relative to cell size and
+    /// `diffusion_coeff` (the standard explicit-scheme CFL-like
+    /// condition); this function does not enforce it — an unstable `dt`
+    /// will show up as growing oscillation, not a silent wrong answer.
+    pub fn step(&mut self, dt: f64, diffusion_coeff: f64) {
+        let c = self.cell_size();
+        let mut next = self.cells.clone();
+
+        for k in 0..self.nz {
+            for j in 0..self.ny {
+                for i in 0..self.nx {
+                    let idx = self.index(i, j, k);
+                    let conc_self = self.cells[idx] / self.cell_volume();
+
+                    let mut net_flux_mass = 0.0; // mass entering this cell this step
+
+                    let mut accumulate = |neighbor_idx: usize, face_area: f64, spacing: f64, cells: &[f64], cell_vol: f64| {
+                        let conc_neighbor = cells[neighbor_idx] / cell_vol;
+                        let flux = diffusion_coeff * (conc_neighbor - conc_self) / spacing * face_area * dt;
+                        net_flux_mass += flux;
+                    };
+
+                    let cell_vol = self.cell_volume();
+                    if i > 0 {
+                        accumulate(self.index(i - 1, j, k), c[1] * c[2], c[0], &self.cells, cell_vol);
+                    }
+                    if i + 1 < self.nx {
+                        accumulate(self.index(i + 1, j, k), c[1] * c[2], c[0], &self.cells, cell_vol);
+                    }
+                    if j > 0 {
+                        accumulate(self.index(i, j - 1, k), c[0] * c[2], c[1], &self.cells, cell_vol);
+                    }
+                    if j + 1 < self.ny {
+                        accumulate(self.index(i, j + 1, k), c[0] * c[2], c[1], &self.cells, cell_vol);
+                    }
+                    if k > 0 {
+                        accumulate(self.index(i, j, k - 1), c[0] * c[1], c[2], &self.cells, cell_vol);
+                    }
+                    if k + 1 < self.nz {
+                        accumulate(self.index(i, j, k + 1), c[0] * c[1], c[2], &self.cells, cell_vol);
+                    }
+
+                    next[idx] = self.cells[idx] + net_flux_mass;
+                }
+            }
+        }
+
+        self.cells = next;
+    }
+
+    pub fn cells_iter(&self) -> impl Iterator<Item = &f64> {
+        self.cells.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn field(nx: usize, ny: usize, nz: usize) -> ConcentrationField {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        ConcentrationField::new(bounds, nx, ny, nz)
+    }
+
+    #[test]
+    fn deposit_and_total_mass_agree() {
+        let mut f = field(5, 5, 5);
+        f.deposit([1.0, 1.0, 1.0], 10.0);
+        f.deposit([9.0, 9.0, 9.0], 5.0);
+        assert!((f.total_mass() - 15.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn withdraw_caps_at_available_mass() {
+        let mut f = field(5, 5, 5);
+        f.deposit([1.0, 1.0, 1.0], 3.0);
+        let actual = f.withdraw([1.0, 1.0, 1.0], 10.0);
+        assert!((actual - 3.0).abs() < 1e-12);
+        assert!(f.total_mass().abs() < 1e-12);
+    }
+
+    #[test]
+    fn withdraw_never_leaves_negative_mass() {
+        let mut f = field(5, 5, 5);
+        f.deposit([1.0, 1.0, 1.0], 2.0);
+        f.withdraw([1.0, 1.0, 1.0], 5.0);
+        f.withdraw([1.0, 1.0, 1.0], 5.0);
+        assert!(f.total_mass() >= 0.0);
+    }
+
+    #[test]
+    fn sample_returns_mass_divided_by_cell_volume() {
+        let mut f = field(2, 2, 2);
+        f.deposit([1.0, 1.0, 1.0], 8.0);
+        let expected_conc = 8.0 / f.cell_volume();
+        assert!((f.sample([1.0, 1.0, 1.0]) - expected_conc).abs() < 1e-9);
+    }
+
+    #[test]
+    fn diffusion_step_exactly_conserves_total_mass() {
+        let mut f = field(9, 9, 9);
+        f.deposit([2.0, 2.0, 2.0], 50.0);
+        f.deposit([7.0, 8.0, 3.0], 20.0);
+        let before = f.total_mass();
+        for _ in 0..30 {
+            f.step(0.001, 0.5);
+        }
+        let after = f.total_mass();
+        assert!((after - before).abs() < 1e-9, "before={before}, after={after}");
+    }
+
+    #[test]
+    fn diffusion_spreads_mass_toward_neighbors() {
+        let mut f = field(11, 11, 11);
+        f.deposit([5.0, 5.0, 5.0], 100.0);
+        let center_before = f.sample([5.0, 5.0, 5.0]);
+        f.step(0.001, 0.3);
+        let center_after = f.sample([5.0, 5.0, 5.0]);
+        assert!(center_after < center_before, "concentrated mass should diffuse outward, reducing the peak");
+    }
+
+    #[test]
+    fn diffusion_does_nothing_to_a_uniform_field() {
+        let mut f = field(6, 6, 6);
+        for i in 0..6 {
+            for j in 0..6 {
+                for k in 0..6 {
+                    let cell_vol = f.cell_volume();
+                    let pos = [
+                        f.bounds.min[0] + (i as f64 + 0.5) * f.cell_size()[0],
+                        f.bounds.min[1] + (j as f64 + 0.5) * f.cell_size()[1],
+                        f.bounds.min[2] + (k as f64 + 0.5) * f.cell_size()[2],
+                    ];
+                    f.deposit(pos, 10.0 * cell_vol);
+                }
+            }
+        }
+        let before: Vec<f64> = f.cells_iter().copied().collect();
+        f.step(0.001, 0.4);
+        let after: Vec<f64> = f.cells_iter().copied().collect();
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert!((b - a).abs() < 1e-6, "uniform field should be a fixed point of diffusion");
+        }
+    }
+
+    #[test]
+    fn no_flux_boundary_keeps_mass_from_leaving_domain() {
+        // Deposit right at a corner cell, where diffusion has the fewest
+        // neighbors (no-flux boundary on 3 sides) -- mass should still
+        // conserve exactly, confirming boundary cells aren't losing mass
+        // to "missing" neighbors.
+        let mut f = field(6, 6, 6);
+        f.deposit([0.5, 0.5, 0.5], 40.0);
+        let before = f.total_mass();
+        for _ in 0..20 {
+            f.step(0.001, 0.4);
+        }
+        assert!((f.total_mass() - before).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cell_of_clamps_boundary_positions_into_valid_range() {
+        let f = field(4, 4, 4);
+        // Exactly on the far boundary -- should map to the last cell, not panic.
+        f.sample([10.0, 10.0, 10.0]);
+    }
+
+    #[test]
+    fn cell_volume_matches_bounds_volume_over_cell_count() {
+        let f = field(5, 4, 2);
+        let expected = f.bounds.volume() / (5.0 * 4.0 * 2.0);
+        assert!((f.cell_volume() - expected).abs() < 1e-12);
+    }
+}
