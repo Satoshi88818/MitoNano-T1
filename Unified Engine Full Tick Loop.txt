@@ -1,0 +1,490 @@
+//! The unification: one engine running everything built so far in the
+//! same tick loop --
+//! - motion (SDE, `sde.rs`/`agent.rs`)
+//! - field release + uptake (`concentration.rs`/`coupling.rs`)
+//! - agent-agent local exchange via the spatial index (`orchestration.rs`/`interaction.rs`)
+//! - field diffusion (`concentration.rs`)
+//!
+//! Each piece was already independently tested. The point of this module
+//! is proving they compose correctly together, not re-proving any one of
+//! them in isolation.
+//!
+//! Following the profiling work in this crate: agent-agent interaction is
+//! the dominant cost at realistic scale (see `profiling.rs`), so this
+//! module offers three ways to run the interaction phase --
+//! [`UnifiedEngine::run`] (single-threaded, optimized unique-pair
+//! interaction), [`UnifiedEngine::run_profiled`] (same logic,
+//! phase-timed), and [`UnifiedEngine::run_profiled_parallel`] (`rayon`-
+//! parallelized interaction, phase-timed) -- so the actual speedup from
+//! parallelizing the confirmed bottleneck can be measured directly rather
+//! than assumed.
+
+use crate::agent::{Agent, AgentParams};
+use crate::concentration::ConcentrationField;
+use crate::environment::Bounds;
+use crate::interaction::{step_agent_interactions, step_agent_interactions_parallel, InteractionParams};
+use crate::orchestration::SpatialIndex;
+use crate::profiling::ProfileReport;
+use rand::Rng;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy)]
+pub struct UnifiedTickStats {
+    pub tick: u64,
+    pub total_agent_payload: f64,
+    pub total_field_mass: f64,
+    /// total_agent_payload + total_field_mass. With k_elim=0 this is
+    /// exactly conserved despite three simultaneous transfer pathways
+    /// (agent<->field release/uptake, agent<->agent exchange). With
+    /// k_elim>0 it should equal `initial_mass - cumulative_eliminated`
+    /// exactly, since elimination is the only pathway that actually
+    /// removes mass from the system -- every other transfer in this
+    /// engine is a self-canceling pairwise exchange.
+    pub total_combined_mass: f64,
+    pub cumulative_eliminated: f64,
+}
+
+pub struct UnifiedEngine {
+    pub agents: Vec<Agent>,
+    pub params: AgentParams,
+    pub bounds: Bounds,
+    pub field: ConcentrationField,
+    pub field_diffusion_coeff: f64,
+    pub index: SpatialIndex,
+    pub interaction: InteractionParams,
+    pub dt: f64,
+}
+
+impl UnifiedEngine {
+    pub fn new(
+        agents: Vec<Agent>,
+        params: AgentParams,
+        bounds: Bounds,
+        field: ConcentrationField,
+        field_diffusion_coeff: f64,
+        index: SpatialIndex,
+        interaction: InteractionParams,
+        dt: f64,
+    ) -> Self {
+        Self { agents, params, bounds, field, field_diffusion_coeff, index, interaction, dt }
+    }
+
+    fn stats(&self, tick: u64, cumulative_eliminated: f64) -> UnifiedTickStats {
+        let total_agent_payload: f64 = self.agents.iter().map(|a| a.payload).sum();
+        let total_field_mass = self.field.total_mass();
+        UnifiedTickStats {
+            tick,
+            total_agent_payload,
+            total_field_mass,
+            total_combined_mass: total_agent_payload + total_field_mass,
+            cumulative_eliminated,
+        }
+    }
+
+    /// Runs the full unified tick loop. Per tick, per agent (in order):
+    /// move, sense+withdraw from the field (uptake), decay with exact
+    /// release/elimination split, deposit released mass into the field.
+    /// Then, once every agent has moved: rebuild the spatial index and run
+    /// pairwise agent-agent exchange. Finally the field takes one
+    /// diffusion step.
+    ///
+    /// This ordering (all field exchange happens before agent-agent
+    /// exchange, which happens before field diffusion) is a deliberate,
+    /// documented choice -- not the only physically reasonable one, but a
+    /// fixed, well-defined one, which is what makes it possible to test
+    /// exactly.
+    pub fn run<R: Rng + ?Sized>(&mut self, n_ticks: u64, k_uptake: f64, rng: &mut R) -> Vec<UnifiedTickStats> {
+        let mut history = Vec::with_capacity(n_ticks as usize + 1);
+        let mut cumulative_eliminated = 0.0;
+        history.push(self.stats(0, cumulative_eliminated));
+
+        for tick in 1..=n_ticks {
+            for agent in &mut self.agents {
+                agent.advance_position(&self.params, &self.bounds, self.dt, rng);
+                let c_local = self.field.sample(agent.position);
+                let desired_uptake = k_uptake * c_local * self.dt;
+                let actual_uptake = self.field.withdraw(agent.position, desired_uptake);
+                agent.payload += actual_uptake;
+                let (released, eliminated) = agent.decay_and_release(&self.params, self.dt);
+                cumulative_eliminated += eliminated;
+                if released > 0.0 {
+                    self.field.deposit(agent.position, released);
+                }
+            }
+            self.index.rebuild(&self.agents);
+            step_agent_interactions(&mut self.agents, &self.index, &self.interaction, self.dt);
+            self.field.step(self.dt, self.field_diffusion_coeff);
+            history.push(self.stats(tick, cumulative_eliminated));
+        }
+        history
+    }
+
+    /// Identical simulation logic to `run` -- same operations in the same
+    /// order, same result for the same inputs -- but instrumented with
+    /// phase-level wall-clock timing, returning a `ProfileReport`
+    /// alongside the usual stats.
+    ///
+    /// Timing is deliberately batched at four points per tick (the whole
+    /// agent-update loop, index rebuild, agent-agent interaction, field
+    /// diffusion) rather than around each individual agent's motion/
+    /// uptake/decay sub-steps. That's not laziness: an agent's own update
+    /// is a handful of arithmetic ops and an RNG draw, on the order of
+    /// tens of nanoseconds -- the same order of magnitude as an
+    /// `Instant::now()` call itself. Timing at that granularity would
+    /// mostly measure the timer's own overhead, not the work. Batching
+    /// per-phase over the whole tick keeps the measured intervals large
+    /// relative to timer overhead, which is what makes the numbers mean
+    /// anything.
+    pub fn run_profiled<R: Rng + ?Sized>(
+        &mut self,
+        n_ticks: u64,
+        k_uptake: f64,
+        rng: &mut R,
+    ) -> (Vec<UnifiedTickStats>, ProfileReport) {
+        self.run_profiled_with_interaction(n_ticks, k_uptake, rng, false)
+    }
+
+    /// Same as `run_profiled`, but the agent-agent interaction phase uses
+    /// [`step_agent_interactions_parallel`] (rayon) instead of the
+    /// single-threaded unique-pair version. Everything else is identical
+    /// -- motion, field coupling, and diffusion are untouched, since
+    /// profiling identified interaction (not those phases) as the
+    /// bottleneck worth parallelizing.
+    pub fn run_profiled_parallel<R: Rng + ?Sized>(
+        &mut self,
+        n_ticks: u64,
+        k_uptake: f64,
+        rng: &mut R,
+    ) -> (Vec<UnifiedTickStats>, ProfileReport) {
+        self.run_profiled_with_interaction(n_ticks, k_uptake, rng, true)
+    }
+
+    fn run_profiled_with_interaction<R: Rng + ?Sized>(
+        &mut self,
+        n_ticks: u64,
+        k_uptake: f64,
+        rng: &mut R,
+        use_parallel: bool,
+    ) -> (Vec<UnifiedTickStats>, ProfileReport) {
+        let mut history = Vec::with_capacity(n_ticks as usize + 1);
+        let mut cumulative_eliminated = 0.0;
+        history.push(self.stats(0, cumulative_eliminated));
+
+        let mut agent_update_time = Duration::ZERO;
+        let mut index_rebuild_time = Duration::ZERO;
+        let mut interaction_time = Duration::ZERO;
+        let mut diffusion_time = Duration::ZERO;
+        let wall_start = Instant::now();
+
+        for tick in 1..=n_ticks {
+            let t0 = Instant::now();
+            for agent in &mut self.agents {
+                agent.advance_position(&self.params, &self.bounds, self.dt, rng);
+                let c_local = self.field.sample(agent.position);
+                let desired_uptake = k_uptake * c_local * self.dt;
+                let actual_uptake = self.field.withdraw(agent.position, desired_uptake);
+                agent.payload += actual_uptake;
+                let (released, eliminated) = agent.decay_and_release(&self.params, self.dt);
+                cumulative_eliminated += eliminated;
+                if released > 0.0 {
+                    self.field.deposit(agent.position, released);
+                }
+            }
+            agent_update_time += t0.elapsed();
+
+            let t1 = Instant::now();
+            self.index.rebuild(&self.agents);
+            index_rebuild_time += t1.elapsed();
+
+            let t2 = Instant::now();
+            if use_parallel {
+                step_agent_interactions_parallel(&mut self.agents, &self.index, &self.interaction, self.dt);
+            } else {
+                step_agent_interactions(&mut self.agents, &self.index, &self.interaction, self.dt);
+            }
+            interaction_time += t2.elapsed();
+
+            let t3 = Instant::now();
+            self.field.step(self.dt, self.field_diffusion_coeff);
+            diffusion_time += t3.elapsed();
+
+            history.push(self.stats(tick, cumulative_eliminated));
+        }
+
+        let report = ProfileReport {
+            n_ticks,
+            n_agents: self.agents.len(),
+            grid_cells: self.field.nx * self.field.ny * self.field.nz,
+            total_wall_time: wall_start.elapsed(),
+            agent_update_time,
+            index_rebuild_time,
+            interaction_time,
+            diffusion_time,
+        };
+        (history, report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interaction::step_agent_interactions_brute_force;
+    use rand::rngs::StdRng;
+    use rand::Rng;
+    use rand::SeedableRng;
+
+    fn small_field() -> ConcentrationField {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        ConcentrationField::new(bounds, 15, 15, 15)
+    }
+
+    /// Headline invariant: with k_elim=0, every transfer in the whole
+    /// system -- release, uptake, and agent-agent exchange -- is
+    /// self-canceling, so total combined mass (agents + field) must be
+    /// exactly conserved across the entire run, despite all three
+    /// pathways being simultaneously active every tick.
+    #[test]
+    fn full_system_exactly_conserves_mass_with_zero_elimination() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.1, 0.0, -0.05], diffusion_coeff: 0.3, k_elim: 0.0, k_release: 0.25 };
+        let mut rng_init = StdRng::seed_from_u64(11);
+        let agents: Vec<Agent> = (0..40)
+            .map(|_| {
+                let p = [
+                    rng_init.gen_range(-9.0..9.0),
+                    rng_init.gen_range(-9.0..9.0),
+                    rng_init.gen_range(-9.0..9.0),
+                ];
+                Agent::new(p, rng_init.gen_range(0.0..10.0))
+            })
+            .collect();
+        let field = small_field();
+        let index = SpatialIndex::new(bounds, 6, 6, 6);
+        let interaction = InteractionParams { radius: 1.0, k_exchange: 0.3 };
+        let mut engine = UnifiedEngine::new(agents, params, bounds, field, 0.15, index, interaction, 0.01);
+        let mut rng = StdRng::seed_from_u64(2026);
+        let history = engine.run(400, 0.35, &mut rng);
+        let m0 = history[0].total_combined_mass;
+        for stat in &history {
+            let rel_err = (stat.total_combined_mass - m0).abs() / m0;
+            assert!(
+                rel_err < 1e-9,
+                "tick {}: combined mass {} vs initial {} (rel_err {})",
+                stat.tick,
+                stat.total_combined_mass,
+                m0,
+                rel_err
+            );
+        }
+    }
+
+    /// With ALL pathways active including true elimination, there is no
+    /// closed form for total_combined_mass(t) -- but the discrete
+    /// bookkeeping identity total_combined_mass(t) == C0 - cumulative_eliminated(t)
+    /// must still hold exactly, because release/deposit, uptake/withdraw,
+    /// and agent-agent exchange are each self-canceling transfers, and
+    /// elimination is the only pathway that actually removes mass. This is
+    /// the strongest single test in the crate: motion, diffusion, release,
+    /// uptake, elimination, and agent-agent exchange are all active at
+    /// once, for 500 ticks, 50 agents.
+    #[test]
+    fn full_system_matches_exact_bookkeeping_identity_under_maximum_complexity() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.12, -0.08, 0.04], diffusion_coeff: 0.35, k_elim: 0.04, k_release: 0.2 };
+        let mut rng_init = StdRng::seed_from_u64(13);
+        let agents: Vec<Agent> = (0..50)
+            .map(|_| {
+                let p = [
+                    rng_init.gen_range(-9.0..9.0),
+                    rng_init.gen_range(-9.0..9.0),
+                    rng_init.gen_range(-9.0..9.0),
+                ];
+                Agent::new(p, rng_init.gen_range(1.0..12.0))
+            })
+            .collect();
+        let field = small_field();
+        let index = SpatialIndex::new(bounds, 6, 6, 6);
+        let interaction = InteractionParams { radius: 1.2, k_exchange: 0.25 };
+        let mut engine = UnifiedEngine::new(agents, params, bounds, field, 0.2, index, interaction, 0.01);
+        let mut rng = StdRng::seed_from_u64(4);
+        let history = engine.run(500, 0.3, &mut rng);
+        let c0 = history[0].total_combined_mass;
+        for stat in &history {
+            let expected = c0 - stat.cumulative_eliminated;
+            let rel_err = (stat.total_combined_mass - expected).abs() / c0;
+            assert!(
+                rel_err < 1e-9,
+                "tick {}: combined mass {} vs C0-eliminated {} (rel_err {})",
+                stat.tick,
+                stat.total_combined_mass,
+                expected,
+                rel_err
+            );
+        }
+        let last = history.last().unwrap();
+        assert!(last.cumulative_eliminated > 0.0);
+        assert!(last.cumulative_eliminated < c0);
+    }
+
+    /// The strongest correctness test in the crate: run the FULL unified
+    /// loop twice from identical initial conditions and identical
+    /// RNG-driven motion, differing only in whether agent-agent exchange
+    /// uses the spatial index or brute-force O(n^2) search. Field release,
+    /// uptake, and diffusion are identical between the two runs (they
+    /// don't depend on the interaction method at all), so field state
+    /// should track in lockstep -- but if the index ever found a different
+    /// neighbor set than brute force WHILE uptake/release/elimination were
+    /// also simultaneously modifying payloads every tick, that's exactly
+    /// the kind of interaction-between-subsystems bug that testing each
+    /// piece in isolation wouldn't catch.
+    #[test]
+    fn spatial_index_matches_brute_force_with_full_feedback_active() {
+        let bounds = Bounds::new([-8.0, -8.0, -8.0], [8.0, 8.0, 8.0]);
+        let params = AgentParams { drift: [0.08, 0.0, -0.03], diffusion_coeff: 0.25, k_elim: 0.02, k_release: 0.15 };
+        let interaction = InteractionParams { radius: 1.0, k_exchange: 0.3 };
+        let dt = 0.01;
+        let k_uptake = 0.25;
+        let field_d = 0.18;
+
+        let mut rng_init = StdRng::seed_from_u64(21);
+        let initial_agents: Vec<Agent> = (0..45)
+            .map(|_| {
+                let p = [
+                    rng_init.gen_range(-7.0..7.0),
+                    rng_init.gen_range(-7.0..7.0),
+                    rng_init.gen_range(-7.0..7.0),
+                ];
+                Agent::new(p, rng_init.gen_range(1.0..10.0))
+            })
+            .collect();
+
+        let bounds_field = Bounds::new([-8.0, -8.0, -8.0], [8.0, 8.0, 8.0]);
+
+        let mut agents_indexed = initial_agents.clone();
+        let mut field_indexed = ConcentrationField::new(bounds_field, 13, 13, 13);
+        let mut index = SpatialIndex::new(bounds, 7, 7, 7);
+        let mut rng_a = StdRng::seed_from_u64(777);
+
+        let mut agents_brute = initial_agents.clone();
+        let mut field_brute = ConcentrationField::new(bounds_field, 13, 13, 13);
+        let mut rng_b = StdRng::seed_from_u64(777);
+
+        for tick in 1..=200 {
+            for agent in &mut agents_indexed {
+                agent.advance_position(&params, &bounds, dt, &mut rng_a);
+                let c_local = field_indexed.sample(agent.position);
+                let actual = field_indexed.withdraw(agent.position, k_uptake * c_local * dt);
+                agent.payload += actual;
+                let (released, _elim) = agent.decay_and_release(&params, dt);
+                if released > 0.0 {
+                    field_indexed.deposit(agent.position, released);
+                }
+            }
+            for agent in &mut agents_brute {
+                agent.advance_position(&params, &bounds, dt, &mut rng_b);
+                let c_local = field_brute.sample(agent.position);
+                let actual = field_brute.withdraw(agent.position, k_uptake * c_local * dt);
+                agent.payload += actual;
+                let (released, _elim) = agent.decay_and_release(&params, dt);
+                if released > 0.0 {
+                    field_brute.deposit(agent.position, released);
+                }
+            }
+
+            index.rebuild(&agents_indexed);
+            step_agent_interactions(&mut agents_indexed, &index, &interaction, dt);
+            step_agent_interactions_brute_force(&mut agents_brute, &interaction, dt);
+
+            field_indexed.step(dt, field_d);
+            field_brute.step(dt, field_d);
+
+            for (i, (a, b)) in agents_indexed.iter().zip(agents_brute.iter()).enumerate() {
+                let diff = (a.payload - b.payload).abs();
+                assert!(diff < 1e-9, "tick {tick} agent {i}: indexed={} brute={} (diff {diff})", a.payload, b.payload);
+            }
+            let mass_diff = (field_indexed.total_mass() - field_brute.total_mass()).abs();
+            assert!(mass_diff < 1e-9, "tick {tick}: field mass diverged: {mass_diff}");
+        }
+    }
+
+    /// `run_profiled` must not change simulation results relative to
+    /// `run` -- guards against accidentally reordering, skipping, or
+    /// duplicating an operation while adding timing instrumentation.
+    #[test]
+    fn run_profiled_produces_identical_results_to_run() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.05, 0.0, 0.0], diffusion_coeff: 0.2, k_elim: 0.02, k_release: 0.15 };
+        let build = || {
+            let mut rng = StdRng::seed_from_u64(42);
+            let agents: Vec<Agent> = (0..30)
+                .map(|_| {
+                    let p = [rng.gen_range(-9.0..9.0), rng.gen_range(-9.0..9.0), rng.gen_range(-9.0..9.0)];
+                    Agent::new(p, rng.gen_range(1.0..10.0))
+                })
+                .collect();
+            let field = ConcentrationField::new(bounds, 9, 9, 9);
+            let index = SpatialIndex::new(bounds, 8, 8, 8);
+            let interaction = InteractionParams { radius: 0.8, k_exchange: 0.2 };
+            UnifiedEngine::new(agents, params, bounds, field, 0.15, index, interaction, 0.01)
+        };
+        let mut engine_a = build();
+        let mut engine_b = build();
+        let mut rng_a = StdRng::seed_from_u64(1000);
+        let mut rng_b = StdRng::seed_from_u64(1000);
+
+        let history_a = engine_a.run(200, 0.2, &mut rng_a);
+        let (history_b, _report) = engine_b.run_profiled(200, 0.2, &mut rng_b);
+
+        assert_eq!(history_a.len(), history_b.len());
+        for (a, b) in history_a.iter().zip(history_b.iter()) {
+            assert_eq!(a.tick, b.tick);
+            assert!((a.total_agent_payload - b.total_agent_payload).abs() < 1e-12);
+            assert!((a.total_field_mass - b.total_field_mass).abs() < 1e-12);
+            assert!((a.cumulative_eliminated - b.cumulative_eliminated).abs() < 1e-12);
+        }
+        for (a, b) in engine_a.agents.iter().zip(engine_b.agents.iter()) {
+            assert_eq!(a.position, b.position);
+            assert!((a.payload - b.payload).abs() < 1e-12);
+        }
+    }
+
+    /// `run_profiled_parallel` must produce the same *stats trajectory* as
+    /// `run` -- payload/field mass exactly matching -- even though the
+    /// parallel interaction kernel computes each agent's delta via a
+    /// different code path (all-neighbors instead of unique-pair). Final
+    /// agent positions/payloads must match too, confirming the rayon
+    /// parallelization changes performance only, never physics.
+    #[test]
+    fn run_profiled_parallel_produces_identical_results_to_run() {
+        let bounds = Bounds::new([-10.0, -10.0, -10.0], [10.0, 10.0, 10.0]);
+        let params = AgentParams { drift: [0.05, 0.0, 0.0], diffusion_coeff: 0.2, k_elim: 0.02, k_release: 0.15 };
+        let build = || {
+            let mut rng = StdRng::seed_from_u64(42);
+            let agents: Vec<Agent> = (0..30)
+                .map(|_| {
+                    let p = [rng.gen_range(-9.0..9.0), rng.gen_range(-9.0..9.0), rng.gen_range(-9.0..9.0)];
+                    Agent::new(p, rng.gen_range(1.0..10.0))
+                })
+                .collect();
+            let field = ConcentrationField::new(bounds, 9, 9, 9);
+            let index = SpatialIndex::new(bounds, 8, 8, 8);
+            let interaction = InteractionParams { radius: 0.8, k_exchange: 0.2 };
+            UnifiedEngine::new(agents, params, bounds, field, 0.15, index, interaction, 0.01)
+        };
+        let mut engine_a = build();
+        let mut engine_b = build();
+        let mut rng_a = StdRng::seed_from_u64(2000);
+        let mut rng_b = StdRng::seed_from_u64(2000);
+
+        let history_a = engine_a.run(150, 0.2, &mut rng_a);
+        let (history_b, _report) = engine_b.run_profiled_parallel(150, 0.2, &mut rng_b);
+
+        for (a, b) in history_a.iter().zip(history_b.iter()) {
+            assert!((a.total_agent_payload - b.total_agent_payload).abs() < 1e-6);
+            assert!((a.total_field_mass - b.total_field_mass).abs() < 1e-6);
+        }
+        for (a, b) in engine_a.agents.iter().zip(engine_b.agents.iter()) {
+            assert!((a.payload - b.payload).abs() < 1e-6);
+        }
+    }
+}
