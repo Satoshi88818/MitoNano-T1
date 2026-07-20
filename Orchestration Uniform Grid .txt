@@ -1,0 +1,218 @@
+//! A uniform-grid spatial hash over agent positions, rebuilt each tick,
+//! used to answer "which agents are within radius r of this position"
+//! without an O(n^2) scan.
+
+use crate::agent::Agent;
+use crate::environment::Bounds;
+
+#[derive(Clone, Debug)]
+pub struct SpatialIndex {
+    pub bounds: Bounds,
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+    cells: Vec<Vec<usize>>, // cell -> agent indices
+}
+
+impl SpatialIndex {
+    pub fn new(bounds: Bounds, nx: usize, ny: usize, nz: usize) -> Self {
+        assert!(nx > 0 && ny > 0 && nz > 0);
+        SpatialIndex { bounds, nx, ny, nz, cells: vec![Vec::new(); nx * ny * nz] }
+    }
+
+    /// Convenience constructor that picks a grid resolution so each
+    /// cell's side length is approximately `interaction_radius` — tuned
+    /// specifically to minimize wasted candidate-pair checks for a
+    /// neighbor search at that radius. A cell size much larger than the
+    /// query radius means each query pulls in far more candidates than
+    /// actually fall within range (most get filtered out after the fact);
+    /// a cell size much smaller multiplies the number of neighboring
+    /// cells that must be visited per query. Sizing cells to the radius
+    /// itself keeps both costs balanced.
+    pub fn for_interaction_radius(bounds: Bounds, interaction_radius: f64) -> Self {
+        assert!(interaction_radius > 0.0);
+        let size = bounds.size();
+        let cells_per_axis = |extent: f64| -> usize { (extent / interaction_radius).floor().max(1.0) as usize };
+        Self::new(bounds, cells_per_axis(size[0]), cells_per_axis(size[1]), cells_per_axis(size[2]))
+    }
+
+    #[inline]
+    fn index(&self, i: usize, j: usize, k: usize) -> usize {
+        i + self.nx * (j + self.ny * k)
+    }
+
+    fn cell_of(&self, position: [f64; 3]) -> (usize, usize, usize) {
+        let s = self.bounds.size();
+        let cell = [s[0] / self.nx as f64, s[1] / self.ny as f64, s[2] / self.nz as f64];
+        let clamp_idx = |x: f64, lo: f64, c: f64, n: usize| -> usize {
+            let raw = ((x - lo) / c).floor();
+            (raw.max(0.0) as usize).min(n - 1)
+        };
+        (
+            clamp_idx(position[0], self.bounds.min[0], cell[0], self.nx),
+            clamp_idx(position[1], self.bounds.min[1], cell[1], self.ny),
+            clamp_idx(position[2], self.bounds.min[2], cell[2], self.nz),
+        )
+    }
+
+    pub fn cell_size(&self) -> [f64; 3] {
+        let s = self.bounds.size();
+        [s[0] / self.nx as f64, s[1] / self.ny as f64, s[2] / self.nz as f64]
+    }
+
+    /// Clears and rebuilds the index from scratch against `agents`'
+    /// current positions.
+    pub fn rebuild(&mut self, agents: &[Agent]) {
+        for cell in &mut self.cells {
+            cell.clear();
+        }
+        for (idx, agent) in agents.iter().enumerate() {
+            let (i, j, k) = self.cell_of(agent.position);
+            self.cells[self.index(i, j, k)].push(idx);
+        }
+    }
+
+    /// All agent indices within `radius` of `position` (excluding none by
+    /// default — callers wanting to exclude self should filter the
+    /// returned index out). Visits every grid cell that could possibly
+    /// contain a point within `radius`, then filters by exact distance.
+    pub fn neighbors_within(&self, position: [f64; 3], radius: f64, agents: &[Agent]) -> Vec<usize> {
+        let cell = self.cell_size();
+        let (ci, cj, ck) = self.cell_of(position);
+        let reach = |c: f64, n: usize| -> usize { (radius / c).ceil() as usize + 1 };
+        let ri = reach(cell[0], self.nx);
+        let rj = reach(cell[1], self.ny);
+        let rk = reach(cell[2], self.nz);
+
+        let mut result = Vec::new();
+        let radius_sq = radius * radius;
+
+        let i_lo = ci.saturating_sub(ri);
+        let i_hi = (ci + ri).min(self.nx - 1);
+        let j_lo = cj.saturating_sub(rj);
+        let j_hi = (cj + rj).min(self.ny - 1);
+        let k_lo = ck.saturating_sub(rk);
+        let k_hi = (ck + rk).min(self.nz - 1);
+
+        for k in k_lo..=k_hi {
+            for j in j_lo..=j_hi {
+                for i in i_lo..=i_hi {
+                    for &agent_idx in &self.cells[self.index(i, j, k)] {
+                        let p = agents[agent_idx].position;
+                        let dx = p[0] - position[0];
+                        let dy = p[1] - position[1];
+                        let dz = p[2] - position[2];
+                        if dx * dx + dy * dy + dz * dz <= radius_sq {
+                            result.push(agent_idx);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Which cell (as a flat index) a given agent index currently occupies
+    /// — used by `interaction.rs` to enumerate unique pairs exactly once
+    /// by iterating cells directly rather than re-querying per agent.
+    pub fn cell_agents(&self) -> &[Vec<usize>] {
+        &self.cells
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_agents(positions: &[[f64; 3]]) -> Vec<Agent> {
+        positions.iter().map(|&p| Agent::new(p, 1.0)).collect()
+    }
+
+    #[test]
+    fn neighbors_within_finds_all_points_in_range() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let agents = make_agents(&[[5.0, 5.0, 5.0], [5.5, 5.0, 5.0], [8.0, 8.0, 8.0]]);
+        let mut idx = SpatialIndex::new(bounds, 5, 5, 5);
+        idx.rebuild(&agents);
+
+        let neighbors = idx.neighbors_within([5.0, 5.0, 5.0], 1.0, &agents);
+        assert!(neighbors.contains(&0));
+        assert!(neighbors.contains(&1));
+        assert!(!neighbors.contains(&2));
+    }
+
+    #[test]
+    fn neighbors_within_excludes_points_outside_radius() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let agents = make_agents(&[[1.0, 1.0, 1.0], [9.0, 9.0, 9.0]]);
+        let mut idx = SpatialIndex::new(bounds, 4, 4, 4);
+        idx.rebuild(&agents);
+        let neighbors = idx.neighbors_within([1.0, 1.0, 1.0], 0.5, &agents);
+        assert_eq!(neighbors, vec![0]);
+    }
+
+    #[test]
+    fn rebuild_clears_previous_state() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let mut idx = SpatialIndex::new(bounds, 5, 5, 5);
+        let agents_a = make_agents(&[[5.0, 5.0, 5.0]]);
+        idx.rebuild(&agents_a);
+        assert_eq!(idx.neighbors_within([5.0, 5.0, 5.0], 0.1, &agents_a).len(), 1);
+
+        let agents_b: Vec<Agent> = vec![];
+        idx.rebuild(&agents_b);
+        assert_eq!(idx.neighbors_within([5.0, 5.0, 5.0], 5.0, &agents_b).len(), 0);
+    }
+
+    #[test]
+    fn matches_brute_force_neighbor_search_on_random_points() {
+        use rand::rngs::StdRng;
+        use rand::Rng;
+        use rand::SeedableRng;
+
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [20.0, 20.0, 20.0]);
+        let mut rng = StdRng::seed_from_u64(42);
+        let positions: Vec<[f64; 3]> = (0..200)
+            .map(|_| [rng.gen_range(0.0..20.0), rng.gen_range(0.0..20.0), rng.gen_range(0.0..20.0)])
+            .collect();
+        let agents = make_agents(&positions);
+        let mut idx = SpatialIndex::new(bounds, 6, 6, 6);
+        idx.rebuild(&agents);
+
+        let query = [10.0, 10.0, 10.0];
+        let radius = 3.0;
+        let mut from_index = idx.neighbors_within(query, radius, &agents);
+        from_index.sort_unstable();
+
+        let mut brute_force: Vec<usize> = (0..agents.len())
+            .filter(|&i| {
+                let p = agents[i].position;
+                let d2 = (p[0] - query[0]).powi(2) + (p[1] - query[1]).powi(2) + (p[2] - query[2]).powi(2);
+                d2 <= radius * radius
+            })
+            .collect();
+        brute_force.sort_unstable();
+
+        assert_eq!(from_index, brute_force);
+    }
+
+    #[test]
+    fn for_interaction_radius_produces_cells_close_to_the_requested_size() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [30.0, 30.0, 30.0]);
+        let radius = 1.5;
+        let idx = SpatialIndex::for_interaction_radius(bounds, radius);
+        let cell = idx.cell_size();
+        for c in cell {
+            assert!(c >= radius * 0.5 && c <= radius * 2.0, "cell size {c} should be roughly comparable to radius {radius}");
+        }
+    }
+
+    #[test]
+    fn empty_index_returns_no_neighbors() {
+        let bounds = Bounds::new([0.0, 0.0, 0.0], [10.0, 10.0, 10.0]);
+        let mut idx = SpatialIndex::new(bounds, 4, 4, 4);
+        let agents: Vec<Agent> = vec![];
+        idx.rebuild(&agents);
+        assert!(idx.neighbors_within([5.0, 5.0, 5.0], 100.0, &agents).is_empty());
+    }
+}
