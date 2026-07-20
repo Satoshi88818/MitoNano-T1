@@ -1,0 +1,93 @@
+//! The simplest layer: agents move and decay, with no field to release
+//! into. `released` mass at this layer has nowhere to go and is treated
+//! as lost — the same as elimination — since there's no field for it to
+//! be deposited into yet (that's `coupling.rs`'s job).
+
+use rand::Rng;
+
+use crate::agent::{Agent, AgentParams};
+use crate::environment::Bounds;
+
+#[derive(Debug, Clone, Copy)]
+pub struct TickStats {
+    pub tick: u64,
+    pub total_payload: f64,
+}
+
+pub struct Engine {
+    pub agents: Vec<Agent>,
+    pub params: AgentParams,
+    pub bounds: Bounds,
+    pub dt: f64,
+}
+
+impl Engine {
+    pub fn new(agents: Vec<Agent>, params: AgentParams, bounds: Bounds, dt: f64) -> Self {
+        Engine { agents, params, bounds, dt }
+    }
+
+    fn stats(&self, tick: u64) -> TickStats {
+        TickStats { tick, total_payload: self.agents.iter().map(|a| a.payload).sum() }
+    }
+
+    pub fn run<R: Rng + ?Sized>(&mut self, n_ticks: u64, rng: &mut R) -> Vec<TickStats> {
+        let mut history = Vec::with_capacity(n_ticks as usize + 1);
+        history.push(self.stats(0));
+        for tick in 1..=n_ticks {
+            for agent in &mut self.agents {
+                agent.advance_position(&self.params, &self.bounds, self.dt, rng);
+                agent.decay_and_release(&self.params, self.dt); // released+eliminated both leave the system at this layer
+            }
+            history.push(self.stats(tick));
+        }
+        history
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    #[test]
+    fn total_payload_matches_closed_form_exponential_decay() {
+        let bounds = Bounds::new([-50.0, -50.0, -50.0], [50.0, 50.0, 50.0]);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.1, k_elim: 0.1, k_release: 0.05 };
+        let agents = vec![Agent::new([0.0, 0.0, 0.0], 10.0); 20];
+        let mut engine = Engine::new(agents, params, bounds, 0.01);
+        let mut rng = StdRng::seed_from_u64(1);
+        let history = engine.run(300, &mut rng);
+
+        let k_total = params.k_elim + params.k_release;
+        let t = 300.0 * 0.01;
+        let expected = 20.0 * 10.0 * (-k_total * t).exp();
+        let last = history.last().unwrap().total_payload;
+        assert!((last - expected).abs() / expected < 1e-9);
+    }
+
+    #[test]
+    fn agents_never_leave_bounds_across_a_run() {
+        let bounds = Bounds::new([-5.0, -5.0, -5.0], [5.0, 5.0, 5.0]);
+        let params = AgentParams { drift: [0.3, -0.2, 0.1], diffusion_coeff: 1.0, k_elim: 0.0, k_release: 0.0 };
+        let agents = vec![Agent::new([0.0, 0.0, 0.0], 1.0); 10];
+        let mut engine = Engine::new(agents, params, bounds, 0.02);
+        let mut rng = StdRng::seed_from_u64(2);
+        engine.run(500, &mut rng);
+        for agent in &engine.agents {
+            assert!(bounds.contains(agent.position));
+        }
+    }
+
+    #[test]
+    fn zero_everything_leaves_state_unchanged() {
+        let bounds = Bounds::new([-5.0, -5.0, -5.0], [5.0, 5.0, 5.0]);
+        let params = AgentParams { drift: [0.0, 0.0, 0.0], diffusion_coeff: 0.0, k_elim: 0.0, k_release: 0.0 };
+        let agents = vec![Agent::new([1.0, 2.0, 3.0], 7.0)];
+        let mut engine = Engine::new(agents, params, bounds, 0.01);
+        let mut rng = StdRng::seed_from_u64(3);
+        engine.run(100, &mut rng);
+        assert_eq!(engine.agents[0].position, [1.0, 2.0, 3.0]);
+        assert_eq!(engine.agents[0].payload, 7.0);
+    }
+}
